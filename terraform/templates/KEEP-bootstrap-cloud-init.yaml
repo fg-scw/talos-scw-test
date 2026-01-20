@@ -56,7 +56,6 @@ write_files:
 
   # NVIDIA Device Plugin - Static manifest v0.14.5 (compatible with Talos)
   # Note: Helm chart v0.15.0+ has scheduling issues on Talos (see issue #12103)
-  # MIG_STRATEGY=single exposes each MIG instance as a separate GPU resource
   - path: /root/nvidia-device-plugin.yaml
     permissions: '0644'
     content: |
@@ -98,12 +97,6 @@ write_files:
                 env:
                   - name: FAIL_ON_INIT_ERROR
                     value: "false"
-                  # MIG Strategy Configuration:
-                  # - "none": Ignores MIG, exposes whole GPU (default)
-                  # - "single": Exposes each MIG instance as separate GPU
-                  # - "mixed": Supports both whole GPU and MIG instances
-                  - name: MIG_STRATEGY
-                    value: "single"
                 securityContext:
                   allowPrivilegeEscalation: false
                   capabilities:
@@ -165,9 +158,6 @@ write_files:
                     value: "60s"
                   - name: GFD_FAIL_ON_INIT_ERROR
                     value: "false"
-                  # Enable MIG mode detection for proper labeling
-                  - name: GFD_MIG_STRATEGY
-                    value: "single"
                 securityContext:
                   privileged: true
             tolerations:
@@ -541,8 +531,7 @@ write_files:
         
         # Install NVIDIA Device Plugin using static manifest (NOT Helm)
         # Helm chart v0.15.0+ has issues on Talos - see issue #12103
-        # MIG_STRATEGY=single configured to expose each MIG instance as separate GPU
-        log "Installing NVIDIA Device Plugin (static manifest v0.14.5 with MIG_STRATEGY=single)..."
+        log "Installing NVIDIA Device Plugin (static manifest v0.14.5)..."
         kubectl apply -f /root/nvidia-device-plugin.yaml
         log_ok "NVIDIA Device Plugin installed"
         
