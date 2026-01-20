@@ -1,24 +1,15 @@
-# ============================================================================
-# Security Groups
-# ============================================================================
+# =============================================================================
+# Security Group for Talos Nodes
+# =============================================================================
 
-# Security Group pour Control Plane
-resource "scaleway_instance_security_group" "control_plane" {
-  name                    = "${var.cluster_name}-cp-sg"
-  description             = "Security group for Talos control plane nodes"
+resource "scaleway_instance_security_group" "talos" {
+  name                    = "${var.cluster_name}-talos-sg"
+  zone                    = var.zone
   inbound_default_policy  = "drop"
   outbound_default_policy = "accept"
   stateful                = true
-  zone                    = var.zone
-  tags                    = local.common_tags
 
-  inbound_rule {
-    action   = "accept"
-    protocol = "TCP"
-    port     = 6443
-    ip_range = var.private_network_cidr
-  }
-
+  # Talos API
   inbound_rule {
     action   = "accept"
     protocol = "TCP"
@@ -26,6 +17,23 @@ resource "scaleway_instance_security_group" "control_plane" {
     ip_range = var.private_network_cidr
   }
 
+  # Talos Trustd
+  inbound_rule {
+    action   = "accept"
+    protocol = "TCP"
+    port     = 50001
+    ip_range = var.private_network_cidr
+  }
+
+  # Kubernetes API
+  inbound_rule {
+    action   = "accept"
+    protocol = "TCP"
+    port     = 6443
+    ip_range = var.private_network_cidr
+  }
+
+  # etcd
   inbound_rule {
     action   = "accept"
     protocol = "TCP"
@@ -40,6 +48,7 @@ resource "scaleway_instance_security_group" "control_plane" {
     ip_range = var.private_network_cidr
   }
 
+  # Kubelet
   inbound_rule {
     action   = "accept"
     protocol = "TCP"
@@ -47,18 +56,12 @@ resource "scaleway_instance_security_group" "control_plane" {
     ip_range = var.private_network_cidr
   }
 
+  # Cilium
   inbound_rule {
     action   = "accept"
     protocol = "TCP"
     port     = 4240
     ip_range = var.private_network_cidr
-  }
-
-  inbound_rule {
-    action     = "accept"
-    protocol   = "TCP"
-    port_range = "4244-4245"
-    ip_range   = var.private_network_cidr
   }
 
   inbound_rule {
@@ -68,68 +71,43 @@ resource "scaleway_instance_security_group" "control_plane" {
     ip_range = var.private_network_cidr
   }
 
+  # ICMP
   inbound_rule {
     action   = "accept"
     protocol = "ICMP"
     ip_range = var.private_network_cidr
   }
+
+  tags = local.common_tags
 }
 
-# Security Group pour Workers
-resource "scaleway_instance_security_group" "workers" {
-  name                    = "${var.cluster_name}-workers-sg"
-  description             = "Security group for Talos worker nodes"
+# =============================================================================
+# Security Group for Bastion
+# =============================================================================
+
+resource "scaleway_instance_security_group" "bastion" {
+  count = var.enable_bootstrap_bastion ? 1 : 0
+
+  name                    = "${var.cluster_name}-bastion-sg"
+  zone                    = var.zone
   inbound_default_policy  = "drop"
   outbound_default_policy = "accept"
   stateful                = true
-  zone                    = var.zone
-  tags                    = local.common_tags
 
+  # SSH
   inbound_rule {
     action   = "accept"
     protocol = "TCP"
-    port     = 10250
+    port     = 22
     ip_range = var.private_network_cidr
   }
 
-  inbound_rule {
-    action     = "accept"
-    protocol   = "TCP"
-    port_range = "30000-32767"
-    ip_range   = var.private_network_cidr
-  }
-
-  inbound_rule {
-    action   = "accept"
-    protocol = "TCP"
-    port     = 4240
-    ip_range = var.private_network_cidr
-  }
-
-  inbound_rule {
-    action     = "accept"
-    protocol   = "TCP"
-    port_range = "4244-4245"
-    ip_range   = var.private_network_cidr
-  }
-
-  inbound_rule {
-    action   = "accept"
-    protocol = "UDP"
-    port     = 8472
-    ip_range = var.private_network_cidr
-  }
-
-  inbound_rule {
-    action   = "accept"
-    protocol = "TCP"
-    port     = 50000
-    ip_range = var.private_network_cidr
-  }
-
+  # ICMP
   inbound_rule {
     action   = "accept"
     protocol = "ICMP"
     ip_range = var.private_network_cidr
   }
+
+  tags = local.common_tags
 }

@@ -7,9 +7,9 @@ packer {
   }
 }
 
-# =========================
+# =============================================================================
 # Variables
-# =========================
+# =============================================================================
 
 variable "scw_access_key" {
   type      = string
@@ -31,47 +31,58 @@ variable "scw_project_id" {
 
 variable "zone" {
   type        = string
-  description = "Scaleway zone where the image will be created"
+  description = "Scaleway zone"
   default     = "fr-par-2"
 }
 
 variable "talos_version" {
   type        = string
-  description = "Talos Linux version to build"
+  description = "Talos Linux version"
   default     = "v1.12.1"
 }
 
 variable "base_image" {
   type        = string
-  description = "Base Scaleway image for the build process"
+  description = "Base Scaleway image for build"
   default     = "ubuntu_jammy"
 }
 
 variable "commercial_type" {
   type        = string
-  description = "Instance type used during build"
+  description = "Instance type for build"
   default     = "PRO2-XXS"
 }
 
 variable "volume_size" {
   type        = number
-  description = "Root volume size in GB for the build instance"
+  description = "Root volume size in GB"
   default     = 10
 }
 
-# =========================
-# Locals
-# =========================
-
-locals {
-  timestamp       = regex_replace(timestamp(), "[- TZ:]", "")
-  image_full_name = "talos-scaleway-${var.talos_version}-${local.timestamp}"
-  stable_image_name = "talos-scaleway-${var.talos_version}"
+variable "schematic_file" {
+  type        = string
+  description = "Schematic file path"
+  default     = "provision/schematic-minimal.yaml"
 }
 
-# =========================
+variable "image_suffix" {
+  type        = string
+  description = "Image name suffix (-minimal, -gpu)"
+  default     = "-minimal"
+}
+
+# =============================================================================
+# Locals
+# =============================================================================
+
+locals {
+  image_name    = "talos-scaleway-${var.talos_version}${var.image_suffix}"
+  snapshot_name = "talos-snapshot-${var.talos_version}${var.image_suffix}"
+}
+
+# =============================================================================
 # Source
-# =========================
+# =============================================================================
 
 source "scaleway" "talos" {
   access_key = var.scw_access_key
@@ -82,8 +93,8 @@ source "scaleway" "talos" {
   image           = var.base_image
   commercial_type = var.commercial_type
 
-  image_name    = local.image_full_name
-  snapshot_name = "talos-snapshot-${var.talos_version}-${local.timestamp}"
+  image_name    = local.image_name
+  snapshot_name = local.snapshot_name
 
   communicator = "ssh"
   ssh_username = "root"
@@ -97,42 +108,40 @@ source "scaleway" "talos" {
     "talos",
     "packer",
     var.talos_version,
+    trimprefix(var.image_suffix, "-"),
   ]
 }
 
-# =========================
+# =============================================================================
 # Build
-# =========================
+# =============================================================================
 
 build {
-  name = "talos-scaleway-image"
+  name = "talos-scaleway"
 
   source "scaleway.talos" {
     name = "talos"
   }
 
+  # Wait for cloud-init
   provisioner "shell" {
     inline = [
       "echo '==> Waiting for cloud-init...'",
-      "cloud-init status --wait || echo 'cloud-init status returned non-zero (ignore)'",
+      "cloud-init status --wait || true",
     ]
   }
 
+  # Upload schematic
   provisioner "file" {
-    source      = "provision/build-image.sh"
-    destination = "/tmp/build-image.sh"
-  }
-
-  provisioner "file" {
-    source      = "provision/schematic.yaml"
+    source      = var.schematic_file
     destination = "/tmp/schematic.yaml"
   }
 
+  # Build Talos image
   provisioner "shell" {
     environment_vars = [
       "TALOS_VERSION=${var.talos_version}",
-      "WORK_DIR=/tmp/talos-build",
-      "SCHEMATIC_FILE=/tmp/schematic.yaml",
+      "IMAGE_SUFFIX=${var.image_suffix}",
     ]
 
     expect_disconnect = true
@@ -140,14 +149,69 @@ build {
 
     inline = [
       "set -e",
-      "echo '==> Installing dependencies'",
       "export DEBIAN_FRONTEND=noninteractive",
-      "apt-get update",
-      "apt-get install -y curl wget jq zstd",
-      "",
-      "echo '==> Executing build script'",
-      "chmod +x /tmp/build-image.sh",
-      "bash /tmp/build-image.sh",
+      
+      "echo ''",
+      "echo '╔═══════════════════════════════════════════════════════════════╗'",
+      "echo '║     Building Talos Image: ${var.talos_version}${var.image_suffix}'",
+      "echo '╚═══════════════════════════════════════════════════════════════╝'",
+      "echo ''",
+      
+      "echo '==> Installing dependencies'",
+      "apt-get update -qq",
+      "apt-get install -y -qq curl wget jq zstd > /dev/null",
+      
+      "echo ''",
+      "echo '==> Schematic content:'",
+      "echo '---'",
+      "cat /tmp/schematic.yaml",
+      "echo '---'",
+      "echo ''",
+      
+      "echo '==> Getting schematic ID from Talos Image Factory...'",
+      "SCHEMATIC_RESPONSE=$(curl -fsSL -X POST --data-binary @/tmp/schematic.yaml https://factory.talos.dev/schematics)",
+      "echo \"Factory response: $SCHEMATIC_RESPONSE\"",
+      "SCHEMATIC_ID=$(echo \"$SCHEMATIC_RESPONSE\" | jq -r '.id')",
+      
+      "if [ -z \"$SCHEMATIC_ID\" ] || [ \"$SCHEMATIC_ID\" = \"null\" ]; then",
+      "  echo 'ERROR: Failed to get schematic ID'",
+      "  exit 1",
+      "fi",
+      
+      "echo ''",
+      "echo '╔═══════════════════════════════════════════════════════════════╗'",
+      "echo \"║  Schematic ID: $SCHEMATIC_ID\"",
+      "echo '╚═══════════════════════════════════════════════════════════════╝'",
+      "echo ''",
+      
+      "echo '==> Downloading Talos image...'",
+      "IMAGE_URL=\"https://factory.talos.dev/image/$SCHEMATIC_ID/$TALOS_VERSION/scaleway-amd64.raw.zst\"",
+      "echo \"URL: $IMAGE_URL\"",
+      "wget --progress=bar:force -O /tmp/talos.raw.zst \"$IMAGE_URL\"",
+      
+      "echo ''",
+      "echo '==> Decompressing image...'",
+      "zstd -d -f --rm /tmp/talos.raw.zst -o /tmp/talos.raw",
+      "ls -lh /tmp/talos.raw",
+      
+      "echo ''",
+      "echo '==> Detecting target disk...'",
+      "TARGET_DISK=\"/dev/$(lsblk -dn -o NAME,TYPE | awk '$2==\"disk\"{print $1; exit}')\"",
+      "echo \"Target: $TARGET_DISK\"",
+      
+      "echo ''",
+      "echo '==> Writing Talos image to disk...'",
+      "dd if=/dev/zero of=$TARGET_DISK bs=1M count=4 conv=fsync 2>/dev/null || true",
+      "dd if=/tmp/talos.raw of=$TARGET_DISK bs=4M status=progress conv=fsync",
+      
+      "echo ''",
+      "echo '╔═══════════════════════════════════════════════════════════════╗'",
+      "echo '║  ✓ Talos image written successfully!'",
+      "echo '║'",
+      "echo \"║  Image: talos-scaleway-$TALOS_VERSION$IMAGE_SUFFIX\"",
+      "echo \"║  Schematic: $SCHEMATIC_ID\"",
+      "echo '╚═══════════════════════════════════════════════════════════════╝'",
+      "echo ''",
     ]
   }
 

@@ -1,172 +1,207 @@
-.PHONY: help packer-init packer-build terraform-init terraform-plan terraform-apply terraform-destroy clean \
-        bootstrap-status bootstrap-logs bootstrap-download-configs bootstrap-cleanup deploy-all
+# =============================================================================
+# Talos Kubernetes on Scaleway - Makefile
+# =============================================================================
 
+.PHONY: help init build-minimal build-gpu build-all deploy destroy clean status logs download cleanup validate
+
+# Configuration
 ZONE ?= fr-par-2
 TALOS_VERSION ?= v1.12.1
 CLUSTER_NAME ?= talos-k8s
+GATEWAY_IP ?= $(shell cd terraform && terraform output -raw public_gateway_ip 2>/dev/null)
+BASTION_PRIVATE_IP ?= $(shell cd terraform && terraform output -raw bastion_private_ip 2>/dev/null)
+
+# Couleurs
+GREEN := \033[0;32m
+YELLOW := \033[1;33m
+RED := \033[0;31m
+NC := \033[0m
 
 help:
-	@echo "╔════════════════════════════════════════════════════════════════╗"
-	@echo "║         Talos on Scaleway - Makefile Commands                 ║"
-	@echo "╚════════════════════════════════════════════════════════════════╝"
 	@echo ""
-	@echo "🏗️  Build & Deploy:"
-	@echo "  make deploy-all          - Complete deployment (Packer + Terraform)"
-	@echo "  make packer-init         - Initialize Packer plugins"
-	@echo "  make packer-build        - Build Talos image with Packer"
-	@echo "  make terraform-init      - Initialize Terraform"
-	@echo "  make terraform-plan      - Plan Terraform changes"
-	@echo "  make terraform-apply     - Apply Terraform configuration"
+	@echo "╔═══════════════════════════════════════════════════════════════╗"
+	@echo "║     Talos Kubernetes on Scaleway - GPU Ready                  ║"
+	@echo "╚═══════════════════════════════════════════════════════════════╝"
 	@echo ""
-	@echo "🚀 Bootstrap (Automatic via Bastion):"
-	@echo "  make bootstrap-status    - Watch bootstrap progress in real-time"
-	@echo "  make bootstrap-logs      - View bootstrap logs"
-	@echo "  make bootstrap-download  - Download kubeconfig & talosconfig from bastion"
-	@echo "  make bootstrap-cleanup   - Destroy bastion after successful bootstrap"
+	@echo "🔧 Setup:"
+	@echo "  make init               - Initialize Packer and Terraform"
+	@echo ""
+	@echo "🏗️  Build Images:"
+	@echo "  make build-minimal      - Build Talos image for control plane & CPU workers"
+	@echo "  make build-gpu          - Build Talos image for GPU workers (with NVIDIA)"
+	@echo "  make build-all          - Build both images (required before deploy)"
+	@echo "  make clean-images       - Delete old Talos images from Scaleway"
+	@echo ""
+	@echo "🚀 Deploy:"
+	@echo "  make deploy             - Deploy infrastructure with Terraform"
+	@echo "  make all                - Build all images + Deploy infrastructure"
+	@echo ""
+	@echo "📊 Operations:"
+	@echo "  make status             - Show bootstrap progress"
+	@echo "  make logs               - Show full bootstrap logs"
+	@echo "  make ssh                - SSH to bastion"
+	@echo "  make download           - Download kubeconfig and talosconfig"
+	@echo "  make validate           - Validate GPU node has NVIDIA extensions"
 	@echo ""
 	@echo "🧹 Cleanup:"
-	@echo "  make terraform-destroy   - Destroy entire infrastructure"
-	@echo "  make clean               - Clean temporary files"
-	@echo ""
-	@echo "📋 Variables:"
-	@echo "  ZONE=$(ZONE)"
-	@echo "  TALOS_VERSION=$(TALOS_VERSION)"
-	@echo "  CLUSTER_NAME=$(CLUSTER_NAME)"
+	@echo "  make cleanup            - Destroy bastion only (keep cluster)"
+	@echo "  make destroy            - Destroy all infrastructure"
 	@echo ""
 
-# ============================================================================
-# Packer - Image Building
-# ============================================================================
+# =============================================================================
+# Initialization
+# =============================================================================
 
-packer-init:
-	@echo "🔧 Initializing Packer..."
+init:
+	@echo "$(GREEN)🔧 Initializing Packer...$(NC)"
 	cd packer && packer init .
+	@echo "$(GREEN)🔧 Initializing Terraform...$(NC)"
+	cd terraform && terraform init
+	@echo "$(GREEN)✅ Initialization complete$(NC)"
 
-packer-build: packer-init
-	@echo "🏗️  Building Talos $(TALOS_VERSION) image for $(ZONE)..."
+# =============================================================================
+# Image Building
+# =============================================================================
+
+clean-images:
+	@echo "$(YELLOW)🧹 Cleaning old Talos images from Scaleway...$(NC)"
+	@echo "  Looking for images matching: talos-scaleway-$(TALOS_VERSION)-*"
+	@for img_id in $$(scw instance image list zone=$(ZONE) -o json 2>/dev/null | jq -r '.[] | select(.name | startswith("talos-scaleway-$(TALOS_VERSION)")) | .id'); do \
+		img_name=$$(scw instance image get $$img_id zone=$(ZONE) -o json | jq -r '.name'); \
+		echo "  Deleting image: $$img_name ($$img_id)"; \
+		scw instance image delete $$img_id zone=$(ZONE) with-snapshots=true 2>/dev/null || true; \
+	done
+	@echo "$(GREEN)✅ Old images cleaned$(NC)"
+
+build-minimal: 
+	@echo "$(GREEN)🏗️  Building Talos $(TALOS_VERSION) minimal image...$(NC)"
 	cd packer && packer build \
 		-var "zone=$(ZONE)" \
 		-var "talos_version=$(TALOS_VERSION)" \
+		-var "schematic_file=provision/schematic-minimal.yaml" \
+		-var "image_suffix=-minimal" \
+		-force \
 		talos-scaleway.pkr.hcl
-	@echo "✅ Talos image built successfully!"
+	@echo "$(GREEN)✅ Minimal image built$(NC)"
 
-# ============================================================================
-# Terraform - Infrastructure
-# ============================================================================
+build-gpu:
+	@echo "$(GREEN)🏗️  Building Talos $(TALOS_VERSION) GPU image (with NVIDIA extensions)...$(NC)"
+	cd packer && packer build \
+		-var "zone=$(ZONE)" \
+		-var "talos_version=$(TALOS_VERSION)" \
+		-var "schematic_file=provision/schematic-gpu.yaml" \
+		-var "image_suffix=-gpu" \
+		-force \
+		talos-scaleway.pkr.hcl
+	@echo "$(GREEN)✅ GPU image built$(NC)"
+	@echo ""
+	@echo "$(YELLOW)⚠️  Verifying GPU image contains NVIDIA extensions...$(NC)"
+	@echo "  The image should have been built with schematic containing:"
+	@echo "    - siderolabs/nvidia-open-gpu-kernel-modules-production"
+	@echo "    - siderolabs/nvidia-container-toolkit-production"
 
-terraform-init:
-	@echo "🔧 Initializing Terraform..."
-	cd terraform && terraform init
+build-all: clean-images build-minimal build-gpu
+	@echo "$(GREEN)✅ All Talos images built successfully$(NC)"
 
-terraform-plan: terraform-init
-	@echo "📋 Planning Terraform changes..."
+# Legacy target
+build: build-gpu
+
+# =============================================================================
+# Terraform Deployment
+# =============================================================================
+
+deploy: init
+	@echo "$(GREEN)🚀 Deploying infrastructure...$(NC)"
+	cd terraform && terraform apply -auto-approve
+	@echo ""
+	@echo "$(GREEN)✅ Infrastructure deployed!$(NC)"
+	@echo ""
+	@echo "📊 Follow bootstrap: make status"
+	@echo "🔑 SSH to bastion:   make ssh"
+
+plan:
 	cd terraform && terraform plan
 
-terraform-apply: terraform-init
-	@echo "🚀 Deploying infrastructure..."
-	cd terraform && terraform apply
-	@echo ""
-	@echo "✅ Infrastructure deployed!"
-	@echo ""
-	@echo "📊 To follow bootstrap progress:"
-	@echo "   make bootstrap-status"
-	@echo ""
-	@echo "📝 To view bootstrap logs:"
-	@echo "   make bootstrap-logs"
-	@echo ""
+# =============================================================================
+# Full Deployment
+# =============================================================================
 
-terraform-destroy:
-	@echo "🗑️  Destroying infrastructure..."
-	cd terraform && terraform destroy
-
-# ============================================================================
-# Bootstrap Management
-# ============================================================================
-
-bootstrap-status:
-	@echo "📊 Following bootstrap status (Ctrl+C to exit)..."
-	@BASTION_IP=$$(cd terraform && terraform output -raw bastion_ip 2>/dev/null); \
-	if [ -z "$$BASTION_IP" ] || [ "$$BASTION_IP" = "null" ]; then \
-		echo "❌ Bastion not found. Is bastion_enabled=true?"; \
-		exit 1; \
-	fi; \
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		root@$$BASTION_IP 'journalctl -u talos-bootstrap -f'
-
-bootstrap-logs:
-	@echo "📝 Viewing bootstrap logs..."
-	@BASTION_IP=$$(cd terraform && terraform output -raw bastion_ip 2>/dev/null); \
-	if [ -z "$$BASTION_IP" ] || [ "$$BASTION_IP" = "null" ]; then \
-		echo "❌ Bastion not found. Is bastion_enabled=true?"; \
-		exit 1; \
-	fi; \
-	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		root@$$BASTION_IP 'tail -f /var/log/talos-bootstrap.log'
-
-bootstrap-download:
-	@echo "📥 Downloading Kubernetes configs from bastion..."
-	@BASTION_IP=$$(cd terraform && terraform output -raw bastion_ip 2>/dev/null); \
-	if [ -z "$$BASTION_IP" ] || [ "$$BASTION_IP" = "null" ]; then \
-		echo "❌ Bastion not found. Is bastion_enabled=true?"; \
-		exit 1; \
-	fi; \
-	mkdir -p _out ~/.kube ~/.talos; \
-	echo "📥 Downloading kubeconfig..."; \
-	scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		root@$$BASTION_IP:/root/talos-config/kubeconfig _out/kubeconfig; \
-	cp _out/kubeconfig ~/.kube/$(CLUSTER_NAME)-config; \
-	echo "📥 Downloading talosconfig..."; \
-	scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-		root@$$BASTION_IP:/root/talos-config/talosconfig _out/talosconfig; \
-	cp _out/talosconfig ~/.talos/$(CLUSTER_NAME)-config; \
-	echo ""; \
-	echo "✅ Configs downloaded!"; \
-	echo ""; \
-	echo "📋 To use your cluster:"; \
-	echo "   export KUBECONFIG=~/.kube/$(CLUSTER_NAME)-config"; \
-	echo "   kubectl get nodes"; \
-	echo ""
-
-bootstrap-cleanup:
-	@echo "🧹 Destroying bastion (keeping cluster running)..."
-	cd terraform && terraform destroy -target=scaleway_instance_server.bastion[0] -target=scaleway_instance_ip.bastion[0]
-	@echo "✅ Bastion destroyed. Cluster is still running."
-
-# ============================================================================
-# Complete Deployment
-# ============================================================================
-
-deploy-all: packer-build terraform-apply
+all: build-all deploy
 	@echo ""
 	@echo "╔═══════════════════════════════════════════════════════════════╗"
-	@echo "║          🎉 Complete Deployment Successful! 🎉                 ║"
+	@echo "║          🎉 Complete Deployment Successful! 🎉                ║"
 	@echo "╚═══════════════════════════════════════════════════════════════╝"
 	@echo ""
-	@echo "🚀 Bootstrap is running automatically on the bastion!"
-	@echo ""
-	@echo "📊 Follow progress:"
-	@echo "   make bootstrap-status"
-	@echo ""
-	@echo "⏱️  Expected time: 8-10 minutes"
-	@echo ""
-	@echo "📥 Once complete, download configs:"
-	@echo "   make bootstrap-download"
-	@echo ""
-	@echo "🧹 Clean up bastion:"
-	@echo "   make bootstrap-cleanup"
+	@echo "📊 Follow bootstrap progress:"
+	@echo "   make status"
 	@echo ""
 
-# ============================================================================
+# =============================================================================
+# Operations
+# =============================================================================
+
+ssh:
+	@echo "$(GREEN)🔑 Connecting to bastion...$(NC)"
+	ssh -o StrictHostKeyChecking=no -J bastion@$(GATEWAY_IP):61000 root@$(BASTION_PRIVATE_IP)
+
+status:
+	@echo "$(GREEN)📊 Checking bootstrap status...$(NC)"
+	ssh -o StrictHostKeyChecking=no -J bastion@$(GATEWAY_IP):61000 root@$(BASTION_PRIVATE_IP) \
+		"journalctl -u talos-bootstrap.service -f"
+
+logs:
+	@echo "$(GREEN)📋 Fetching bootstrap logs...$(NC)"
+	ssh -o StrictHostKeyChecking=no -J bastion@$(GATEWAY_IP):61000 root@$(BASTION_PRIVATE_IP) \
+		"journalctl -u talos-bootstrap.service --no-pager"
+
+download:
+	@echo "$(GREEN)⬇️  Downloading configurations...$(NC)"
+	@mkdir -p ~/.kube
+	scp -o StrictHostKeyChecking=no -o ProxyJump=bastion@$(GATEWAY_IP):61000 \
+		root@$(BASTION_PRIVATE_IP):/root/talos-config/kubeconfig ~/.kube/$(CLUSTER_NAME)-config
+	scp -o StrictHostKeyChecking=no -o ProxyJump=bastion@$(GATEWAY_IP):61000 \
+		root@$(BASTION_PRIVATE_IP):/root/talos-config/talosconfig ~/.talos/$(CLUSTER_NAME)-config 2>/dev/null || \
+		(mkdir -p ~/.talos && scp -o StrictHostKeyChecking=no -o ProxyJump=bastion@$(GATEWAY_IP):61000 \
+		root@$(BASTION_PRIVATE_IP):/root/talos-config/talosconfig ~/.talos/$(CLUSTER_NAME)-config)
+	@echo ""
+	@echo "$(GREEN)✅ Configurations downloaded!$(NC)"
+	@echo ""
+	@echo "To use the cluster:"
+	@echo "  export KUBECONFIG=~/.kube/$(CLUSTER_NAME)-config"
+	@echo "  kubectl get nodes"
+
+validate:
+	@echo "$(GREEN)🔍 Validating GPU node configuration...$(NC)"
+	@ssh -o StrictHostKeyChecking=no -J bastion@$(GATEWAY_IP):61000 root@$(BASTION_PRIVATE_IP) \
+		'GPU_IP=$$(kubectl get nodes -l nvidia.com/gpu.present=true -o jsonpath="{.items[0].status.addresses[0].address}" 2>/dev/null); \
+		if [ -z "$$GPU_IP" ]; then echo "❌ No GPU node found"; exit 1; fi; \
+		echo "GPU Node IP: $$GPU_IP"; \
+		echo ""; \
+		echo "=== Extensions ==="; \
+		talosctl -n $$GPU_IP get extensions 2>/dev/null || echo "Cannot get extensions"; \
+		echo ""; \
+		echo "=== NVIDIA Modules ==="; \
+		talosctl -n $$GPU_IP read /proc/modules 2>/dev/null | grep nvidia || echo "No nvidia modules"; \
+		echo ""; \
+		echo "=== GPU Resources ==="; \
+		kubectl get node -l nvidia.com/gpu.present=true -o custom-columns="NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu"'
+
+# =============================================================================
 # Cleanup
-# ============================================================================
+# =============================================================================
 
-clean:
-	@echo "🧹 Cleaning temporary files..."
-	rm -rf packer/packer_cache
+cleanup:
+	@echo "$(YELLOW)🧹 Destroying bastion only...$(NC)"
+	cd terraform && terraform destroy -target=scaleway_instance_server.bastion -auto-approve
+	@echo "$(GREEN)✅ Bastion destroyed. Cluster is still running.$(NC)"
+
+destroy:
+	@echo "$(RED)💥 Destroying all infrastructure...$(NC)"
+	cd terraform && terraform destroy -auto-approve
+	@echo "$(GREEN)✅ All infrastructure destroyed$(NC)"
+
+clean: destroy
+	@echo "$(YELLOW)🧹 Cleaning local files...$(NC)"
+	rm -rf terraform/.terraform terraform/terraform.tfstate* terraform/.terraform.lock.hcl
 	rm -f packer/manifest.json
-	rm -f packer/packer.log
-	rm -rf terraform/.terraform
-	rm -f terraform/.terraform.lock.hcl
-	rm -f terraform/terraform.tfstate*
-	rm -rf _out
-	@echo "✅ Cleaned!"
+	@echo "$(GREEN)✅ Clean complete$(NC)"

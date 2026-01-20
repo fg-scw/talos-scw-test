@@ -1,0 +1,12 @@
+customization:
+  extraKernelArgs:
+    - talos.platform=scaleway
+    - ipv6.disable=1
+    - console=ttyS0
+    - earlyprintk=ttyS0
+  
+  systemExtensions:
+    officialExtensions:
+      # Scaleway guest agent for metadata and monitoring
+      - siderolabs/qemu-guest-agent
+      - siderolabs/util-linux-tools

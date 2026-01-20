@@ -1,26 +1,35 @@
-# ============================================================================
-# Data Sources
-# ============================================================================
+# =============================================================================
+# Talos Images (Minimal for CP/CPU, GPU for GPU workers)
+# =============================================================================
 
-data "scaleway_instance_image" "talos" {
-  name         = var.talos_image_name != "" ? var.talos_image_name : "talos-scaleway-${var.talos_version}"
+data "scaleway_instance_image" "talos_minimal" {
+  name         = "talos-scaleway-${var.talos_version}-minimal"
   architecture = "x86_64"
   zone         = var.zone
   latest       = true
 }
 
-# ============================================================================
-# Control Plane Instances
-# ============================================================================
+data "scaleway_instance_image" "talos_gpu" {
+  count = var.gpu_worker_count > 0 ? 1 : 0
+
+  name         = "talos-scaleway-${var.talos_version}-gpu"
+  architecture = "x86_64"
+  zone         = var.zone
+  latest       = true
+}
+
+# =============================================================================
+# Control Plane Nodes
+# =============================================================================
 
 resource "scaleway_instance_server" "control_plane" {
   count = var.control_plane_count
 
   name              = "${var.cluster_name}-cp-${count.index + 1}"
   type              = var.control_plane_instance_type
-  image             = data.scaleway_instance_image.talos.id
+  image             = data.scaleway_instance_image.talos_minimal.id
   zone              = var.zone
-  security_group_id = scaleway_instance_security_group.control_plane.id
+  security_group_id = scaleway_instance_security_group.talos.id
 
   root_volume {
     size_in_gb            = var.control_plane_disk_size
@@ -32,31 +41,29 @@ resource "scaleway_instance_server" "control_plane" {
     pn_id = scaleway_vpc_private_network.kubernetes.id
   }
 
-  tags = concat(local.common_tags, [
+  tags = concat(local.common_tags, var.additional_tags, [
     "role=control-plane",
-    "node-index=${count.index + 1}"
+    "node-index=${count.index + 1}",
   ])
 
-  depends_on = [
-    scaleway_vpc_gateway_network.kubernetes
-  ]
+  depends_on = [scaleway_vpc_gateway_network.kubernetes]
 }
 
-# ============================================================================
-# Worker Instances
-# ============================================================================
+# =============================================================================
+# GPU Worker Nodes
+# =============================================================================
 
-resource "scaleway_instance_server" "workers" {
-  count = var.worker_count
+resource "scaleway_instance_server" "gpu_workers" {
+  count = var.gpu_worker_count
 
-  name              = "${var.cluster_name}-worker-${count.index + 1}"
-  type              = var.worker_instance_type
-  image             = data.scaleway_instance_image.talos.id
+  name              = "${var.cluster_name}-gpu-worker-${count.index + 1}"
+  type              = var.gpu_worker_instance_type
+  image             = data.scaleway_instance_image.talos_gpu[0].id
   zone              = var.zone
-  security_group_id = scaleway_instance_security_group.workers.id
+  security_group_id = scaleway_instance_security_group.talos.id
 
   root_volume {
-    size_in_gb            = var.worker_disk_size
+    size_in_gb            = var.gpu_worker_disk_size
     volume_type           = "sbs_volume"
     delete_on_termination = true
   }
@@ -65,19 +72,49 @@ resource "scaleway_instance_server" "workers" {
     pn_id = scaleway_vpc_private_network.kubernetes.id
   }
 
-  tags = concat(local.common_tags, [
-    "role=worker",
-    "node-index=${count.index + 1}"
+  tags = concat(local.common_tags, var.additional_tags, [
+    "role=gpu-worker",
+    "node-index=${count.index + 1}",
+    "gpu=nvidia-h100",
   ])
 
-  depends_on = [
-    scaleway_vpc_gateway_network.kubernetes
-  ]
+  depends_on = [scaleway_vpc_gateway_network.kubernetes]
 }
 
-# ============================================================================
-# Data sources pour récupérer les IPs privées via IPAM
-# ============================================================================
+# =============================================================================
+# CPU Worker Nodes
+# =============================================================================
+
+resource "scaleway_instance_server" "cpu_workers" {
+  count = var.cpu_worker_count
+
+  name              = "${var.cluster_name}-cpu-worker-${count.index + 1}"
+  type              = var.cpu_worker_instance_type
+  image             = data.scaleway_instance_image.talos_minimal.id
+  zone              = var.zone
+  security_group_id = scaleway_instance_security_group.talos.id
+
+  root_volume {
+    size_in_gb            = var.cpu_worker_disk_size
+    volume_type           = "sbs_volume"
+    delete_on_termination = true
+  }
+
+  private_network {
+    pn_id = scaleway_vpc_private_network.kubernetes.id
+  }
+
+  tags = concat(local.common_tags, var.additional_tags, [
+    "role=cpu-worker",
+    "node-index=${count.index + 1}",
+  ])
+
+  depends_on = [scaleway_vpc_gateway_network.kubernetes]
+}
+
+# =============================================================================
+# IPAM - Get Private IPs
+# =============================================================================
 
 data "scaleway_ipam_ip" "control_plane" {
   count = var.control_plane_count
@@ -86,27 +123,16 @@ data "scaleway_ipam_ip" "control_plane" {
   type        = "ipv4"
 }
 
-data "scaleway_ipam_ip" "workers" {
-  count = var.worker_count
+data "scaleway_ipam_ip" "gpu_workers" {
+  count = var.gpu_worker_count
 
-  mac_address = scaleway_instance_server.workers[count.index].private_network[0].mac_address
+  mac_address = scaleway_instance_server.gpu_workers[count.index].private_network[0].mac_address
   type        = "ipv4"
 }
 
-# ============================================================================
-# Locals pour les IPs privées (TRIÉES pour être déterministes)
-# ============================================================================
+data "scaleway_ipam_ip" "cpu_workers" {
+  count = var.cpu_worker_count
 
-locals {
-  # IPs des control planes triées par ordre croissant
-  control_plane_ips = sort([
-    for ipam in data.scaleway_ipam_ip.control_plane :
-    split("/", ipam.address)[0]
-  ])
-
-  # IPs des workers triées par ordre croissant
-  worker_ips = sort([
-    for ipam in data.scaleway_ipam_ip.workers :
-    split("/", ipam.address)[0]
-  ])
+  mac_address = scaleway_instance_server.cpu_workers[count.index].private_network[0].mac_address
+  type        = "ipv4"
 }

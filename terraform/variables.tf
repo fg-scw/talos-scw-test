@@ -1,47 +1,31 @@
-# ============================================================================
+# =============================================================================
 # Scaleway Configuration
-# ============================================================================
+# =============================================================================
 
 variable "region" {
   description = "Scaleway region"
   type        = string
   default     = "fr-par"
-  
-  validation {
-    condition     = contains(["fr-par", "nl-ams", "pl-waw"], var.region)
-    error_message = "Region must be fr-par, nl-ams, or pl-waw."
-  }
 }
 
 variable "zone" {
   description = "Scaleway availability zone"
   type        = string
   default     = "fr-par-2"
-  
-  validation {
-    condition     = can(regex("^(fr-par|nl-ams|pl-waw)-[1-3]$", var.zone))
-    error_message = "Zone must be in format <region>-<number> (e.g., fr-par-2)."
-  }
 }
 
-variable "scw_project_id" {
-  description = "Scaleway Project ID (can also be set via SCW_DEFAULT_PROJECT_ID env var)"
-  type        = string
-  default     = ""
-}
-
-# ============================================================================
+# =============================================================================
 # Cluster Configuration
-# ============================================================================
+# =============================================================================
 
 variable "cluster_name" {
   description = "Kubernetes cluster name"
   type        = string
   default     = "talos-k8s"
-  
+
   validation {
-    condition     = can(regex("^[a-z0-9-]+$", var.cluster_name))
-    error_message = "Cluster name must contain only lowercase letters, numbers, and hyphens."
+    condition     = can(regex("^[a-z0-9][a-z0-9-]*[a-z0-9]$", var.cluster_name)) && length(var.cluster_name) <= 24
+    error_message = "Cluster name must be lowercase alphanumeric with hyphens, max 24 chars."
   }
 }
 
@@ -57,173 +41,174 @@ variable "talos_version" {
   default     = "v1.12.1"
 }
 
-# ============================================================================
+# =============================================================================
 # Network Configuration
-# ============================================================================
+# =============================================================================
 
 variable "private_network_cidr" {
-  description = "CIDR for the Private Network (IPAM will auto-allocate if not specified)"
+  description = "CIDR for the Private Network"
   type        = string
   default     = "10.0.0.0/22"
-  
-  validation {
-    condition     = can(cidrhost(var.private_network_cidr, 0))
-    error_message = "CIDR must be valid (e.g., 10.0.0.0/22)."
-  }
 }
 
-# ============================================================================
+# =============================================================================
 # Control Plane Configuration
-# ============================================================================
+# =============================================================================
 
 variable "control_plane_count" {
-  description = "Number of control plane nodes (must be odd for etcd quorum)"
+  description = "Number of control plane nodes (1, 3, or 5)"
   type        = number
   default     = 3
-  
+
   validation {
-    condition     = var.control_plane_count >= 1 && var.control_plane_count <= 5 && var.control_plane_count % 2 == 1
-    error_message = "Control plane count must be odd (1, 3, or 5) for etcd quorum."
+    condition     = contains([1, 3, 5], var.control_plane_count)
+    error_message = "Control plane count must be 1, 3, or 5."
   }
 }
 
 variable "control_plane_instance_type" {
-  description = "Instance type for control plane nodes"
+  description = "Instance type for control plane"
   type        = string
   default     = "PRO2-S"
-  
-  validation {
-    condition     = can(regex("^(DEV1-[SML]|GP1-[XSLM]|PRO2-[XSLM]|POP2-.*C-.*)$", var.control_plane_instance_type))
-    error_message = "Invalid instance type. Examples: DEV1-M, PRO2-S, POP2-4C-16G."
-  }
 }
 
 variable "control_plane_disk_size" {
-  description = "Root disk size for control plane nodes (GB)"
+  description = "Root disk size (GB)"
   type        = number
   default     = 50
-  
-  validation {
-    condition     = var.control_plane_disk_size >= 20 && var.control_plane_disk_size <= 10000
-    error_message = "Disk size must be between 20 GB and 10 TB."
-  }
 }
 
-# ============================================================================
-# Worker Configuration
-# ============================================================================
+# =============================================================================
+# GPU Worker Configuration
+# =============================================================================
 
-variable "worker_count" {
-  description = "Number of worker nodes"
+variable "gpu_worker_count" {
+  description = "Number of GPU workers"
   type        = number
-  default     = 3
-  
-  validation {
-    condition     = var.worker_count >= 0 && var.worker_count <= 50
-    error_message = "Worker count must be between 0 and 50."
-  }
+  default     = 1
 }
 
-variable "worker_instance_type" {
-  description = "Instance type for worker nodes"
+variable "gpu_worker_instance_type" {
+  description = "GPU instance type (H100-1-80G, H100-2-160G)"
   type        = string
-  default     = "PRO2-M"
+  default     = "H100-1-80G"
 }
 
-variable "worker_disk_size" {
-  description = "Root disk size for worker nodes (GB)"
+variable "gpu_worker_disk_size" {
+  description = "Root disk size (GB)"
   type        = number
   default     = 100
 }
 
-# ============================================================================
-# Load Balancer Configuration
-# ============================================================================
+# =============================================================================
+# CPU Worker Configuration
+# =============================================================================
 
-variable "load_balancer_type" {
-  description = "Load Balancer type for Kubernetes API"
+variable "cpu_worker_count" {
+  description = "Number of CPU workers"
+  type        = number
+  default     = 3
+}
+
+variable "cpu_worker_instance_type" {
+  description = "CPU worker instance type"
   type        = string
-  default     = "LB-S"
-  
+  default     = "PRO2-XXS"
+}
+
+variable "cpu_worker_disk_size" {
+  description = "Root disk size (GB)"
+  type        = number
+  default     = 50
+}
+
+# =============================================================================
+# GPU MIG Configuration
+# =============================================================================
+
+variable "enable_gpu_mig" {
+  description = "Enable MIG (Multi-Instance GPU) Manager"
+  type        = bool
+  default     = false
+}
+
+variable "gpu_mig_profile" {
+  description = "Initial MIG profile: all-disabled, all-1g.10gb, all-2g.20gb, all-3g.40gb, mixed-40-20"
+  type        = string
+  default     = "all-disabled"
+
   validation {
-    condition     = contains(["LB-S", "LB-GP-M", "LB-GP-L"], var.load_balancer_type)
-    error_message = "LB type must be LB-S, LB-GP-M, or LB-GP-L."
+    condition     = contains(["all-disabled", "all-1g.10gb", "all-2g.20gb", "all-3g.40gb", "mixed-40-20"], var.gpu_mig_profile)
+    error_message = "Invalid MIG profile."
   }
 }
 
+# =============================================================================
+# Load Balancer Configuration
+# =============================================================================
+
+variable "load_balancer_type" {
+  description = "Load Balancer type"
+  type        = string
+  default     = "LB-S"
+}
+
 variable "expose_k8s_api_publicly" {
-  description = "Expose Kubernetes API publicly (not recommended for production)"
+  description = "Expose K8s API publicly"
   type        = bool
   default     = false
 }
 
 variable "expose_talos_api" {
-  description = "Expose Talos API via Load Balancer (port 50000)"
+  description = "Expose Talos API via LB"
   type        = bool
   default     = true
 }
 
-# ============================================================================
-# Public Gateway Configuration
-# ============================================================================
+# =============================================================================
+# Gateway Configuration
+# =============================================================================
 
 variable "public_gateway_type" {
-  description = "Public Gateway type for NAT"
+  description = "Public Gateway type"
   type        = string
   default     = "VPC-GW-S"
-  
-  validation {
-    condition     = contains(["VPC-GW-S", "VPC-GW-M", "VPC-GW-L"], var.public_gateway_type)
-    error_message = "Gateway type must be VPC-GW-S, VPC-GW-M, or VPC-GW-L."
-  }
 }
 
-variable "enable_bastion_on_gateway" {
-  description = "Enable SSH bastion on Public Gateway"
+variable "enable_gateway_bastion" {
+  description = "Enable SSH bastion on Gateway"
   type        = bool
   default     = true
 }
 
-variable "bastion_ssh_port" {
-  description = "SSH port for bastion on Public Gateway"
+variable "gateway_bastion_port" {
+  description = "SSH port for bastion"
   type        = number
   default     = 61000
 }
 
-variable "bastion_allowed_cidr" {
-  description = "CIDR allowed to access bastion (leave empty for 0.0.0.0/0)"
-  type        = string
-  default     = ""
-}
-
-# ============================================================================
+# =============================================================================
 # Bootstrap Bastion Configuration
-# ============================================================================
+# =============================================================================
 
 variable "enable_bootstrap_bastion" {
-  description = "Créer une instance bastion temporaire pour bootstrapper le cluster"
+  description = "Create bootstrap bastion instance"
   type        = bool
   default     = true
 }
 
 variable "bastion_instance_type" {
-  description = "Type d'instance pour le bastion de bootstrap"
+  description = "Bastion instance type"
   type        = string
   default     = "DEV1-S"
 }
 
-# ============================================================================
-# Additional Configuration
-# ============================================================================
+# =============================================================================
+# Additional Tags
+# =============================================================================
 
 variable "additional_tags" {
-  description = "Additional tags to apply to all resources"
+  description = "Additional tags"
   type        = list(string)
   default     = []
-}
-
-variable "talos_image_name" {
-  description = "Name of the Talos image created by Packer (will be prefixed with talos-scaleway-)"
-  type        = string
-  default     = ""
 }
