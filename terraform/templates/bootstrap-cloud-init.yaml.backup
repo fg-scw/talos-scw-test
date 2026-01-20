@@ -21,9 +21,8 @@ write_files:
           cni:
             name: none
 
-  # GPU worker patch - CRITICAL: includes both kernel modules AND containerd runtime config
-  # Reference: https://www.talos.dev/v1.11/talos-guides/configuration/nvidia-gpu/
-  - path: /root/gpu-worker-patch.yaml
+  # GPU modules patch (explicit NVIDIA module loading for Talos)
+  - path: /root/gpu-modules-patch.yaml
     permissions: '0644'
     content: |
       machine:
@@ -33,16 +32,6 @@ write_files:
             - name: nvidia_uvm
             - name: nvidia_drm
             - name: nvidia_modeset
-        sysctls:
-          net.core.bpf_jit_harden: "1"
-        files:
-          - content: |
-              [plugins]
-              [plugins."io.containerd.cri.v1.runtime"]
-              [plugins."io.containerd.cri.v1.runtime".containerd]
-              default_runtime_name = "nvidia"
-            path: /etc/cri/conf.d/20-customization.part
-            op: create
 
   # NVIDIA RuntimeClass
   - path: /root/nvidia-runtime-class.yaml
@@ -54,165 +43,7 @@ write_files:
         name: nvidia
       handler: nvidia
 
-  # NVIDIA Device Plugin - Static manifest v0.14.5 (compatible with Talos)
-  # Note: Helm chart v0.15.0+ has scheduling issues on Talos (see issue #12103)
-  - path: /root/nvidia-device-plugin.yaml
-    permissions: '0644'
-    content: |
-      apiVersion: v1
-      kind: Namespace
-      metadata:
-        name: nvidia-device-plugin
-        labels:
-          pod-security.kubernetes.io/enforce: privileged
-      ---
-      apiVersion: apps/v1
-      kind: DaemonSet
-      metadata:
-        name: nvidia-device-plugin-daemonset
-        namespace: nvidia-device-plugin
-      spec:
-        selector:
-          matchLabels:
-            name: nvidia-device-plugin-ds
-        updateStrategy:
-          type: RollingUpdate
-        template:
-          metadata:
-            labels:
-              name: nvidia-device-plugin-ds
-          spec:
-            tolerations:
-              - key: nvidia.com/gpu
-                operator: Exists
-                effect: NoSchedule
-              - key: node-role.kubernetes.io/control-plane
-                operator: Exists
-                effect: NoSchedule
-            priorityClassName: system-node-critical
-            runtimeClassName: nvidia
-            containers:
-              - image: nvcr.io/nvidia/k8s-device-plugin:v0.14.5
-                name: nvidia-device-plugin-ctr
-                env:
-                  - name: FAIL_ON_INIT_ERROR
-                    value: "false"
-                securityContext:
-                  allowPrivilegeEscalation: false
-                  capabilities:
-                    drop: ["ALL"]
-                volumeMounts:
-                  - name: device-plugin
-                    mountPath: /var/lib/kubelet/device-plugins
-            volumes:
-              - name: device-plugin
-                hostPath:
-                  path: /var/lib/kubelet/device-plugins
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: nvidia.com/gpu.present
-                          operator: In
-                          values:
-                            - "true"
-                    - matchExpressions:
-                        - key: feature.node.kubernetes.io/pci-10de.present
-                          operator: In
-                          values:
-                            - "true"
-
-  # GPU Feature Discovery for node labeling
-  - path: /root/gpu-feature-discovery.yaml
-    permissions: '0644'
-    content: |
-      apiVersion: apps/v1
-      kind: DaemonSet
-      metadata:
-        name: gpu-feature-discovery
-        namespace: nvidia-device-plugin
-        labels:
-          app.kubernetes.io/name: gpu-feature-discovery
-      spec:
-        selector:
-          matchLabels:
-            app.kubernetes.io/name: gpu-feature-discovery
-        template:
-          metadata:
-            labels:
-              app.kubernetes.io/name: gpu-feature-discovery
-          spec:
-            serviceAccountName: gpu-feature-discovery
-            runtimeClassName: nvidia
-            containers:
-              - image: nvcr.io/nvidia/gpu-feature-discovery:v0.8.2
-                name: gpu-feature-discovery
-                volumeMounts:
-                  - name: output-dir
-                    mountPath: /etc/kubernetes/node-feature-discovery/features.d
-                  - name: host-sys
-                    mountPath: /sys
-                env:
-                  - name: GFD_SLEEP_INTERVAL
-                    value: "60s"
-                  - name: GFD_FAIL_ON_INIT_ERROR
-                    value: "false"
-                securityContext:
-                  privileged: true
-            tolerations:
-              - key: nvidia.com/gpu
-                operator: Exists
-                effect: NoSchedule
-            volumes:
-              - name: output-dir
-                hostPath:
-                  path: /etc/kubernetes/node-feature-discovery/features.d
-              - name: host-sys
-                hostPath:
-                  path: /sys
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                    - matchExpressions:
-                        - key: nvidia.com/gpu.present
-                          operator: In
-                          values:
-                            - "true"
-      ---
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: gpu-feature-discovery
-        namespace: nvidia-device-plugin
-      ---
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
-      metadata:
-        name: gpu-feature-discovery
-      rules:
-        - apiGroups: [""]
-          resources: ["nodes"]
-          verbs: ["get", "patch", "update"]
-        - apiGroups: ["nfd.k8s-sigs.io"]
-          resources: ["nodefeatures"]
-          verbs: ["create", "get", "update"]
-      ---
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: gpu-feature-discovery
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: gpu-feature-discovery
-      subjects:
-        - kind: ServiceAccount
-          name: gpu-feature-discovery
-          namespace: nvidia-device-plugin
-
-  # MIG ConfigMap (for optional MIG support)
+  # MIG ConfigMap
   - path: /root/mig-config.yaml
     permissions: '0644'
     content: |
@@ -249,6 +80,99 @@ write_files:
                 mig-devices:
                   "3g.40gb": 1
                   "2g.20gb": 2
+
+  # MIG Manager RBAC
+  - path: /root/mig-manager-rbac.yaml
+    permissions: '0644'
+    content: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: nvidia-mig-manager
+        namespace: nvidia-device-plugin
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: nvidia-mig-manager
+      rules:
+        - apiGroups: [""]
+          resources: ["nodes"]
+          verbs: ["get", "list", "watch", "patch", "update"]
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["pods/eviction"]
+          verbs: ["create"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: nvidia-mig-manager
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: nvidia-mig-manager
+      subjects:
+        - kind: ServiceAccount
+          name: nvidia-mig-manager
+          namespace: nvidia-device-plugin
+
+  # MIG Manager DaemonSet
+  - path: /root/mig-manager-daemonset.yaml
+    permissions: '0644'
+    content: |
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: nvidia-mig-manager
+        namespace: nvidia-device-plugin
+      spec:
+        selector:
+          matchLabels:
+            app: nvidia-mig-manager
+        template:
+          metadata:
+            labels:
+              app: nvidia-mig-manager
+          spec:
+            serviceAccountName: nvidia-mig-manager
+            nodeSelector:
+              nvidia.com/mig.capable: "true"
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            runtimeClassName: nvidia
+            hostPID: true
+            containers:
+              - name: mig-manager
+                image: nvcr.io/nvidia/cloud-native/k8s-mig-manager:v0.8.0
+                securityContext:
+                  privileged: true
+                env:
+                  - name: NODE_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.nodeName
+                  - name: CONFIG_FILE
+                    value: /mig-parted-config/config.yaml
+                  - name: WITH_REBOOT
+                    value: "false"
+                volumeMounts:
+                  - name: mig-parted-config
+                    mountPath: /mig-parted-config
+                  - name: host-root
+                    mountPath: /host
+                    readOnly: true
+            volumes:
+              - name: mig-parted-config
+                configMap:
+                  name: mig-parted-config
+              - name: host-root
+                hostPath:
+                  path: /
 
   # Bootstrap script
   - path: /root/bootstrap.sh
@@ -356,17 +280,12 @@ write_files:
         --patch @/root/cilium-patch.yaml \
         -o "$CONFIG_DIR/worker-cpu-patched.yaml"
       
-      # GPU workers: Cilium + GPU full patch (modules + containerd nvidia runtime)
+      # GPU workers: Cilium + GPU modules patches
       if [ $${#GPU_WORKER_IPS[@]} -gt 0 ]; then
-        log "Creating GPU worker config with NVIDIA runtime..."
         talosctl machineconfig patch "$CONFIG_DIR/worker.yaml" \
           --patch @/root/cilium-patch.yaml \
-          --patch @/root/gpu-worker-patch.yaml \
+          --patch @/root/gpu-modules-patch.yaml \
           -o "$CONFIG_DIR/worker-gpu-patched.yaml"
-        
-        log "GPU worker patch includes:"
-        log "  - NVIDIA kernel modules (nvidia, nvidia_uvm, nvidia_drm, nvidia_modeset)"
-        log "  - Containerd default_runtime_name = nvidia"
       fi
       
       # -----------------------------------------------------------------------
@@ -382,7 +301,7 @@ write_files:
         log "Applying configurations to GPU workers..."
         for ip in "$${GPU_WORKER_IPS[@]}"; do
           talosctl apply-config --insecure --nodes "$ip" --file "$CONFIG_DIR/worker-gpu-patched.yaml"
-          log_ok "Configured $ip (GPU worker with NVIDIA runtime)"
+          log_ok "Configured $ip (GPU worker)"
         done
       fi
       
@@ -459,133 +378,123 @@ write_files:
         log "Installing GPU Stack..."
         log "=========================================="
         
-        # Create namespace with privileged PSS
+        # RuntimeClass
+        kubectl apply -f /root/nvidia-runtime-class.yaml
+        log_ok "RuntimeClass created"
+        
+        # Label namespaces as privileged
+        kubectl create namespace node-feature-discovery --dry-run=client -o yaml | kubectl apply -f -
         kubectl create namespace nvidia-device-plugin --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label namespace node-feature-discovery pod-security.kubernetes.io/enforce=privileged --overwrite
         kubectl label namespace nvidia-device-plugin pod-security.kubernetes.io/enforce=privileged --overwrite
         kubectl label namespace kube-system pod-security.kubernetes.io/enforce=privileged --overwrite
         log_ok "Namespaces labeled as privileged"
         
-        # RuntimeClass
-        kubectl apply -f /root/nvidia-runtime-class.yaml
-        log_ok "RuntimeClass 'nvidia' created"
-        
-        # Pre-label GPU nodes BEFORE installing NFD/device-plugin
-        log "Pre-labeling GPU nodes..."
-        sleep 30  # Wait for nodes to be fully ready
-        for ip in "$${GPU_WORKER_IPS[@]}"; do
-          NODE_NAME=$(kubectl get nodes -o wide --no-headers | grep "$ip" | awk '{print $1}' || true)
-          if [ -n "$NODE_NAME" ]; then
-            kubectl label node "$NODE_NAME" nvidia.com/gpu.present=true --overwrite || true
-            kubectl label node "$NODE_NAME" feature.node.kubernetes.io/pci-10de.present=true --overwrite || true
-            log_ok "Labeled $NODE_NAME with nvidia.com/gpu.present=true"
-          else
-            log_warn "Could not find node for IP $ip"
-          fi
-        done
-        
-        # Verify GPU node has NVIDIA extensions and modules
-        log "Verifying GPU node configuration..."
-        GPU_IP="$${GPU_WORKER_IPS[0]}"
-        
-        log "Checking NVIDIA extensions on $GPU_IP..."
-        if talosctl -n "$GPU_IP" get extensions 2>/dev/null | grep -q "nvidia"; then
-          log_ok "NVIDIA extensions found"
-          talosctl -n "$GPU_IP" get extensions 2>/dev/null | grep nvidia || true
-        else
-          log_error "NVIDIA extensions NOT found! Please rebuild GPU image."
-        fi
-        
-        log "Checking NVIDIA kernel modules on $GPU_IP..."
-        if talosctl -n "$GPU_IP" read /proc/modules 2>/dev/null | grep -q "^nvidia "; then
-          log_ok "NVIDIA kernel modules loaded"
-          talosctl -n "$GPU_IP" read /proc/modules 2>/dev/null | grep nvidia || true
-        else
-          log_warn "NVIDIA kernel modules not loaded yet - may need more time"
-        fi
-        
-        # Check containerd runtime configuration
-        log "Checking containerd runtime configuration..."
-        if talosctl -n "$GPU_IP" read /etc/cri/conf.d/20-customization.part 2>/dev/null | grep -q "nvidia"; then
-          log_ok "Containerd nvidia runtime configured"
-        else
-          log_error "Containerd nvidia runtime NOT configured! This will cause container failures."
-        fi
-        
-        # Install NFD (Node Feature Discovery) - needed for automatic GPU labeling
+        # NFD
         log "Installing Node Feature Discovery..."
         helm repo add nfd https://kubernetes-sigs.github.io/node-feature-discovery/charts 2>/dev/null || true
         helm repo update
         helm install node-feature-discovery nfd/node-feature-discovery \
           --namespace node-feature-discovery \
-          --create-namespace \
           --set worker.tolerations[0].key=node-role.kubernetes.io/control-plane \
           --set worker.tolerations[0].operator=Exists \
           --set worker.tolerations[0].effect=NoSchedule \
           --timeout 5m || log_warn "NFD install timed out"
-        kubectl label namespace node-feature-discovery pod-security.kubernetes.io/enforce=privileged --overwrite
         log_ok "NFD installed"
         
         # Wait for NFD to discover features
-        log "Waiting 45s for NFD to discover features..."
-        sleep 45
+        sleep 30
         
-        # Install NVIDIA Device Plugin using static manifest (NOT Helm)
-        # Helm chart v0.15.0+ has issues on Talos - see issue #12103
-        log "Installing NVIDIA Device Plugin (static manifest v0.14.5)..."
-        kubectl apply -f /root/nvidia-device-plugin.yaml
+        # Verify GPU node has NVIDIA extensions
+        log "Verifying GPU node has NVIDIA extensions..."
+        GPU_IP="$${GPU_WORKER_IPS[0]}"
+        
+        if talosctl -n "$GPU_IP" get extensions 2>/dev/null | grep -q "nvidia"; then
+          log_ok "NVIDIA extensions found on $GPU_IP"
+        else
+          log_error "NVIDIA extensions NOT found on $GPU_IP!"
+          log_error "The GPU image may not have been built with NVIDIA extensions."
+          log_error "Please rebuild with: make build-gpu"
+          log "Continuing anyway, but GPU support will not work..."
+        fi
+        
+        # Check NVIDIA modules
+        if talosctl -n "$GPU_IP" read /proc/modules 2>/dev/null | grep -q "^nvidia "; then
+          log_ok "NVIDIA kernel modules loaded"
+        else
+          log_warn "NVIDIA kernel modules not loaded yet"
+        fi
+        
+        # Pre-label GPU nodes
+        log "Pre-labeling GPU nodes..."
+        for ip in "$${GPU_WORKER_IPS[@]}"; do
+          NODE_NAME=$(kubectl get nodes -o wide --no-headers | grep "$ip" | awk '{print $1}' || true)
+          if [ -n "$NODE_NAME" ]; then
+            kubectl label node "$NODE_NAME" nvidia.com/gpu.present=true --overwrite || true
+            log_ok "Labeled $NODE_NAME"
+          fi
+        done
+        
+        # NVIDIA Device Plugin
+        log "Installing NVIDIA Device Plugin..."
+        helm repo add nvdp https://nvidia.github.io/k8s-device-plugin 2>/dev/null || true
+        helm repo update
+        
+        helm install nvidia-device-plugin nvdp/nvidia-device-plugin \
+          --namespace nvidia-device-plugin \
+          --set runtimeClassName=nvidia \
+          --set gfd.enabled=true \
+          --set migStrategy=single \
+          --set failOnInitError=false \
+          --set compatWithCPUManager=true \
+          --set nfd.enabled=false \
+          --set-string nodeSelector."nvidia\.com/gpu\.present"=true \
+          --timeout 5m || log_warn "NVIDIA Device Plugin install timed out"
+        
         log_ok "NVIDIA Device Plugin installed"
         
-        # Wait for device plugin to be ready
-        log "Waiting for device plugin pod..."
+        # Wait for GPU resources
+        log "Waiting for GPU resources..."
         for i in {1..30}; do
-          if kubectl -n nvidia-device-plugin get pods -l name=nvidia-device-plugin-ds --no-headers 2>/dev/null | grep -q "Running"; then
-            log_ok "Device plugin pod is running"
+          GPU_COUNT=$(kubectl get nodes -o json 2>/dev/null | jq '[.items[].status.allocatable["nvidia.com/gpu"] // "0" | tonumber] | add' || echo "0")
+          if [ "$GPU_COUNT" != "null" ] && [ "$GPU_COUNT" != "0" ] && [ -n "$GPU_COUNT" ]; then
+            log_ok "Found $GPU_COUNT GPU(s) allocatable"
             break
           fi
           log "  Waiting... ($i/30)"
           sleep 10
         done
         
-        # Show device plugin status
-        kubectl -n nvidia-device-plugin get pods -o wide || true
-        
-        # Wait for GPU resources to appear
-        log "Waiting for GPU resources to be allocatable..."
-        for i in {1..30}; do
-          GPU_COUNT=$(kubectl get nodes -o json 2>/dev/null | jq '[.items[].status.allocatable["nvidia.com/gpu"] // "0" | tonumber] | add' || echo "0")
-          if [ "$GPU_COUNT" != "null" ] && [ "$GPU_COUNT" != "0" ] && [ -n "$GPU_COUNT" ]; then
-            log_ok "Found $GPU_COUNT GPU(s) allocatable!"
-            break
-          fi
-          log "  Waiting for GPUs... ($i/30)"
-          sleep 10
-        done
-        
-        # Show device plugin logs if GPU not found
-        if [ "$GPU_COUNT" = "0" ] || [ -z "$GPU_COUNT" ]; then
-          log_warn "No GPUs found. Checking device plugin logs..."
-          kubectl -n nvidia-device-plugin logs -l name=nvidia-device-plugin-ds --tail=50 || true
-        fi
-        
-        # Install GPU Feature Discovery (optional, for advanced labeling)
-        log "Installing GPU Feature Discovery..."
-        kubectl apply -f /root/gpu-feature-discovery.yaml || log_warn "GFD install failed (optional)"
-        
-        # MIG Configuration (if enabled)
+        # MIG Manager (if enabled)
         if [ "$ENABLE_GPU_MIG" = "true" ]; then
           log "=========================================="
-          log "MIG Configuration"
+          log "Installing MIG Manager..."
           log "=========================================="
-          log_warn "MIG requires manual activation on Talos due to immutable filesystem"
-          log "To enable MIG:"
-          log "  1. SSH to bastion: make ssh"
-          log "  2. Create privileged pod with nvidia-smi"
-          log "  3. Run: nvidia-smi -i 0 -mig 1"
-          log "  4. Reboot GPU node: talosctl -n <GPU_IP> reboot"
-          log "  5. Create MIG instances: nvidia-smi mig -cgi <profiles> -C"
           
-          kubectl apply -f /root/mig-config.yaml || true
+          kubectl apply -f /root/mig-config.yaml
+          kubectl apply -f /root/mig-manager-rbac.yaml
+          kubectl apply -f /root/mig-manager-daemonset.yaml
+          log_ok "MIG Manager installed"
+          
+          # Apply initial profile
+          if [ "$GPU_MIG_PROFILE" != "all-disabled" ]; then
+            log "Applying MIG profile: $GPU_MIG_PROFILE"
+            sleep 30
+            for ip in "$${GPU_WORKER_IPS[@]}"; do
+              NODE_NAME=$(kubectl get nodes -o wide --no-headers | grep "$ip" | awk '{print $1}' || true)
+              if [ -n "$NODE_NAME" ]; then
+                kubectl label node "$NODE_NAME" nvidia.com/mig.config="$GPU_MIG_PROFILE" --overwrite || true
+                log_ok "Applied $GPU_MIG_PROFILE to $NODE_NAME"
+              fi
+            done
+            
+            log "Waiting 60s for MIG reconfiguration..."
+            sleep 60
+            kubectl -n nvidia-device-plugin rollout restart daemonset nvidia-device-plugin || true
+          fi
+          
           log "MIG profiles available: all-disabled, all-1g.10gb, all-2g.20gb, all-3g.40gb, mixed-40-20"
+          log "To change: kubectl label node <node> nvidia.com/mig.config=<profile> --overwrite"
         fi
       fi
       
@@ -603,18 +512,8 @@ write_files:
         log "GPU Resources:"
         kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu' || true
         echo ""
-        log "NVIDIA Device Plugin Pods:"
         kubectl -n nvidia-device-plugin get pods -o wide || true
         echo ""
-        
-        # Test GPU access
-        log "Testing GPU access with nvidia-smi..."
-        kubectl run nvidia-test --rm -it --restart=Never \
-          --image=nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04 \
-          --overrides='{"spec":{"runtimeClassName":"nvidia","nodeSelector":{"nvidia.com/gpu.present":"true"}}}' \
-          --namespace=nvidia-device-plugin \
-          --timeout=60s \
-          -- nvidia-smi 2>/dev/null || log_warn "nvidia-smi test failed or timed out"
       fi
       
       log "Configs saved to: $CONFIG_DIR"
