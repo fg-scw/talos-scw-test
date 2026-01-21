@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "name": "talos",
+      "builder_type": "scaleway",
+      "build_time": 1768986565,
+      "files": null,
+      "artifact_id": "fr-par-2:b81cd9dd-2d26-4bde-b5c3-7fcdee3c5eb1",
+      "packer_run_uuid": "f818cd3f-ae9b-1ff1-ba9e-3b8e08367396",
+      "custom_data": null
+    }
+  ],
+  "last_run_uuid": "f818cd3f-ae9b-1ff1-ba9e-3b8e08367396"
+}
