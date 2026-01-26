@@ -1,0 +1,531 @@
+#cloud-config
+package_update: true
+packages:
+  - curl
+  - jq
+  - netcat-openbsd
+
+write_files:
+  - path: /root/install.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      exec > >(tee -a /var/log/talos-bootstrap.log) 2>&1
+      
+      # === Configuration ===
+      CLUSTER_NAME="${cluster_name}"
+      K8S_ENDPOINT="https://${k8s_api_endpoint}:6443"
+      CONTROL_PLANE_IPS="${control_plane_ips}"
+      GPU_WORKER_IPS="${gpu_worker_ips}"
+      CPU_WORKER_IPS="${cpu_worker_ips}"
+      TOTAL_NODES=${total_nodes}
+      MIG_ENABLED="${mig_enabled}"
+      MIG_PROFILE_CONFIG="${mig_profile_config}"
+      MIG_INSTANCE_COUNT="${mig_instance_count}"
+      
+      CONFIG_DIR="/root/talos-config"
+      export TALOSCONFIG="$CONFIG_DIR/talosconfig"
+      
+      log() { echo "[$(date +%H:%M:%S)] $*"; }
+      
+      mkdir -p /root/patches /root/manifests /root/templates "$CONFIG_DIR"
+      
+      # === Patches ===
+      cat > /root/patches/cilium.yaml << 'EOF'
+      cluster:
+        proxy:
+          disabled: true
+        network:
+          cni:
+            name: none
+      EOF
+      
+      cat > /root/patches/gpu-worker.yaml << 'EOF'
+      machine:
+        kernel:
+          modules:
+            - name: nvidia
+            - name: nvidia_uvm
+            - name: nvidia_drm
+            - name: nvidia_modeset
+        sysctls:
+          net.core.bpf_jit_harden: "1"
+      EOF
+      
+      # === MIG Templates ===
+      cat > /root/templates/mig-check.yaml << 'EOF'
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: mig-check
+        namespace: nvidia-gpu-stack
+      spec:
+        restartPolicy: Never
+        runtimeClassName: nvidia
+        nodeSelector:
+          kubernetes.io/hostname: __NODE__
+        tolerations:
+          - operator: Exists
+        containers:
+          - name: check
+            image: nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04
+            command: ["bash", "-c", "MIG=$(nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null | tr -d ' '); INST=$(nvidia-smi mig -lgi 2>/dev/null | grep -c '1g.10gb' || echo 0); echo MIG_STATUS:$MIG:$INST"]
+            securityContext:
+              privileged: true
+      EOF
+      
+      cat > /root/templates/mig-enable.yaml << 'EOF'
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: mig-enable
+        namespace: nvidia-gpu-stack
+      spec:
+        restartPolicy: Never
+        runtimeClassName: nvidia
+        nodeSelector:
+          kubernetes.io/hostname: __NODE__
+        tolerations:
+          - operator: Exists
+        containers:
+          - name: enable
+            image: nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04
+            command: ["bash", "-c", "nvidia-smi -pm 1 && nvidia-smi -mig 1"]
+            securityContext:
+              privileged: true
+      EOF
+      
+      cat > /root/templates/mig-create.yaml << 'EOF'
+      apiVersion: v1
+      kind: Pod
+      metadata:
+        name: mig-create
+        namespace: nvidia-gpu-stack
+      spec:
+        restartPolicy: Never
+        runtimeClassName: nvidia
+        nodeSelector:
+          kubernetes.io/hostname: __NODE__
+        tolerations:
+          - operator: Exists
+        containers:
+          - name: create
+            image: nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04
+            command: ["bash", "-c", "nvidia-smi mig -cgi __MIG_PROFILE__ -C && nvidia-smi mig -lgi"]
+            securityContext:
+              privileged: true
+      EOF
+      
+      # === GPU Stack ===
+      cat > /root/manifests/gpu-stack.yaml << 'EOF'
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: nvidia-gpu-stack
+        labels:
+          pod-security.kubernetes.io/enforce: privileged
+          pod-security.kubernetes.io/audit: privileged
+          pod-security.kubernetes.io/warn: privileged
+      ---
+      apiVersion: node.k8s.io/v1
+      kind: RuntimeClass
+      metadata:
+        name: nvidia
+      handler: nvidia
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: nfd-master
+        namespace: nvidia-gpu-stack
+      ---
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: nfd-worker
+        namespace: nvidia-gpu-stack
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: nfd-master
+      rules:
+        - apiGroups: [""]
+          resources: ["nodes", "nodes/status"]
+          verbs: ["get", "list", "watch", "patch", "update"]
+        - apiGroups: ["nfd.k8s-sigs.io"]
+          resources: ["nodefeatures"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["coordination.k8s.io"]
+          resources: ["leases"]
+          verbs: ["create", "get", "update"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: nfd-master
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: nfd-master
+      subjects:
+        - kind: ServiceAccount
+          name: nfd-master
+          namespace: nvidia-gpu-stack
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: nfd-worker
+      rules:
+        - apiGroups: ["nfd.k8s-sigs.io"]
+          resources: ["nodefeatures"]
+          verbs: ["create", "get", "update"]
+        - apiGroups: [""]
+          resources: ["nodes"]
+          verbs: ["get", "list", "watch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: nfd-worker
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: nfd-worker
+      subjects:
+        - kind: ServiceAccount
+          name: nfd-worker
+          namespace: nvidia-gpu-stack
+      ---
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: nodefeatures.nfd.k8s-sigs.io
+      spec:
+        group: nfd.k8s-sigs.io
+        names:
+          kind: NodeFeature
+          listKind: NodeFeatureList
+          plural: nodefeatures
+          singular: nodefeature
+        scope: Namespaced
+        versions:
+          - name: v1alpha1
+            served: true
+            storage: true
+            schema:
+              openAPIV3Schema:
+                type: object
+                properties:
+                  spec:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nfd-master
+        namespace: nvidia-gpu-stack
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nfd-master
+        template:
+          metadata:
+            labels:
+              app: nfd-master
+          spec:
+            serviceAccountName: nfd-master
+            tolerations:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: nfd-master
+                image: registry.k8s.io/nfd/node-feature-discovery:v0.16.6
+                command: ["nfd-master", "-port=8080"]
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: 32Mi
+                  limits:
+                    cpu: 100m
+                    memory: 128Mi
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nfd-master
+        namespace: nvidia-gpu-stack
+      spec:
+        selector:
+          app: nfd-master
+        ports:
+          - port: 8080
+      ---
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: nfd-worker
+        namespace: nvidia-gpu-stack
+      spec:
+        selector:
+          matchLabels:
+            app: nfd-worker
+        template:
+          metadata:
+            labels:
+              app: nfd-worker
+          spec:
+            serviceAccountName: nfd-worker
+            dnsPolicy: ClusterFirstWithHostNet
+            tolerations:
+              - operator: Exists
+            containers:
+              - name: nfd-worker
+                image: registry.k8s.io/nfd/node-feature-discovery:v0.16.6
+                command: ["nfd-worker", "-server=nfd-master.nvidia-gpu-stack.svc.cluster.local:8080"]
+                env:
+                  - name: NODE_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: spec.nodeName
+                volumeMounts:
+                  - name: host-boot
+                    mountPath: /host-boot
+                    readOnly: true
+                  - name: host-sys
+                    mountPath: /host-sys
+                    readOnly: true
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: 32Mi
+                  limits:
+                    cpu: 100m
+                    memory: 128Mi
+            volumes:
+              - name: host-boot
+                hostPath:
+                  path: /boot
+              - name: host-sys
+                hostPath:
+                  path: /sys
+      EOF
+      
+      # === Device Plugin ===
+      cat > /root/manifests/device-plugin.yaml << 'EOF'
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: nvidia-device-plugin
+        namespace: nvidia-gpu-stack
+      spec:
+        selector:
+          matchLabels:
+            app: nvidia-device-plugin
+        template:
+          metadata:
+            labels:
+              app: nvidia-device-plugin
+          spec:
+            runtimeClassName: nvidia
+            nodeSelector:
+              nvidia.com/gpu.present: "true"
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            priorityClassName: system-node-critical
+            containers:
+              - name: nvidia-device-plugin
+                image: nvcr.io/nvidia/k8s-device-plugin:v0.14.5
+                securityContext:
+                  privileged: true
+                env:
+                  - name: DEVICE_LIST_STRATEGY
+                    value: "envvar"
+                  - name: PASS_DEVICE_SPECS
+                    value: "true"
+                  - name: FAIL_ON_INIT_ERROR
+                    value: "false"
+                  - name: MIG_STRATEGY
+                    value: "single"
+                  - name: NVIDIA_VISIBLE_DEVICES
+                    value: "all"
+                  - name: NVIDIA_DRIVER_CAPABILITIES
+                    value: "all"
+                volumeMounts:
+                  - name: device-plugin
+                    mountPath: /var/lib/kubelet/device-plugins
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: 32Mi
+                  limits:
+                    cpu: 100m
+                    memory: 128Mi
+            volumes:
+              - name: device-plugin
+                hostPath:
+                  path: /var/lib/kubelet/device-plugins
+      EOF
+      
+      # === Install Tools ===
+      log "Installing tools..."
+      curl -sL https://talos.dev/install | sh >/dev/null 2>&1
+      curl -sLO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      chmod +x kubectl && mv kubectl /usr/local/bin/
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null 2>&1
+      
+      # === Wait for Nodes ===
+      log "Waiting for Talos nodes..."
+      for ip in $CONTROL_PLANE_IPS $GPU_WORKER_IPS $CPU_WORKER_IPS; do
+        [ -z "$ip" ] && continue
+        while ! nc -z -w5 "$ip" 50000 2>/dev/null; do sleep 5; done
+      done
+      
+      # === Generate Config ===
+      FIRST_CP=$(echo "$CONTROL_PLANE_IPS" | awk '{print $1}')
+      log "Generating Talos config..."
+      talosctl gen config "$CLUSTER_NAME" "$K8S_ENDPOINT" --output-dir "$CONFIG_DIR" --with-docs=false --with-examples=false >/dev/null
+      talosctl --talosconfig "$TALOSCONFIG" config endpoint $FIRST_CP
+      talosctl --talosconfig "$TALOSCONFIG" config node $FIRST_CP
+      
+      # === Patch Configs ===
+      talosctl machineconfig patch "$CONFIG_DIR/controlplane.yaml" --patch @/root/patches/cilium.yaml -o "$CONFIG_DIR/controlplane-patched.yaml" >/dev/null
+      talosctl machineconfig patch "$CONFIG_DIR/worker.yaml" --patch @/root/patches/cilium.yaml -o "$CONFIG_DIR/worker-cpu.yaml" >/dev/null
+      [ -n "$GPU_WORKER_IPS" ] && talosctl machineconfig patch "$CONFIG_DIR/worker.yaml" --patch @/root/patches/cilium.yaml --patch @/root/patches/gpu-worker.yaml -o "$CONFIG_DIR/worker-gpu.yaml" >/dev/null
+      
+      # === Apply Configs ===
+      log "Applying configs..."
+      for ip in $CONTROL_PLANE_IPS; do
+        talosctl apply-config --insecure --nodes "$ip" --file "$CONFIG_DIR/controlplane-patched.yaml" >/dev/null 2>&1
+      done
+      for ip in $GPU_WORKER_IPS; do
+        talosctl apply-config --insecure --nodes "$ip" --file "$CONFIG_DIR/worker-gpu.yaml" >/dev/null 2>&1
+      done
+      for ip in $CPU_WORKER_IPS; do
+        talosctl apply-config --insecure --nodes "$ip" --file "$CONFIG_DIR/worker-cpu.yaml" >/dev/null 2>&1
+      done
+      
+      sleep 120
+      
+      # === Bootstrap ===
+      log "Bootstrapping etcd..."
+      talosctl --talosconfig "$TALOSCONFIG" bootstrap --nodes "$FIRST_CP" >/dev/null 2>&1 || true
+      sleep 90
+      
+      talosctl --talosconfig "$TALOSCONFIG" kubeconfig "$CONFIG_DIR/kubeconfig" --nodes "$FIRST_CP" --force >/dev/null 2>&1
+      export KUBECONFIG="$CONFIG_DIR/kubeconfig"
+      
+      # === Cilium ===
+      log "Installing Cilium..."
+      helm repo add cilium https://helm.cilium.io/ >/dev/null 2>&1 || true
+      helm repo update >/dev/null 2>&1
+      helm install cilium cilium/cilium --namespace kube-system \
+        --set ipam.mode=kubernetes \
+        --set kubeProxyReplacement=true \
+        --set k8sServiceHost=${k8s_api_endpoint} \
+        --set k8sServicePort=6443 \
+        --set securityContext.capabilities.ciliumAgent="{CHOWN,KILL,NET_ADMIN,NET_RAW,IPC_LOCK,SYS_ADMIN,SYS_RESOURCE,DAC_OVERRIDE,FOWNER,SETGID,SETUID}" \
+        --set securityContext.capabilities.cleanCiliumState="{NET_ADMIN,SYS_ADMIN,SYS_RESOURCE}" \
+        --set cgroup.autoMount.enabled=true \
+        --set cgroup.hostRoot=/sys/fs/cgroup \
+        --timeout 5m >/dev/null 2>&1
+      
+      # === Wait for Nodes ===
+      log "Waiting for $TOTAL_NODES nodes..."
+      for _ in $(seq 1 40); do
+        READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || true)
+        READY=$${READY:-0}
+        [ "$READY" -ge "$TOTAL_NODES" ] && break
+        sleep 15
+      done
+      log "Nodes ready: $READY/$TOTAL_NODES"
+      
+      # === GPU Configuration ===
+      if [ -n "$GPU_WORKER_IPS" ]; then
+        log "Deploying GPU stack..."
+        kubectl apply -f /root/manifests/gpu-stack.yaml >/dev/null 2>&1
+        sleep 60
+        
+        for ip in $GPU_WORKER_IPS; do
+          NODE=$(kubectl get nodes -o wide --no-headers 2>/dev/null | grep "$ip" | awk '{print $1}')
+          [ -n "$NODE" ] && kubectl label node "$NODE" nvidia.com/gpu.present=true --overwrite >/dev/null 2>&1
+        done
+        
+        if [ "$MIG_ENABLED" = "true" ]; then
+          log "Configuring MIG..."
+          for gpu_ip in $GPU_WORKER_IPS; do
+            GPU_NODE=$(kubectl get nodes -o wide --no-headers 2>/dev/null | grep "$gpu_ip" | awk '{print $1}')
+            [ -z "$GPU_NODE" ] && continue
+            
+            # Check MIG status
+            sed "s/__NODE__/$GPU_NODE/g" /root/templates/mig-check.yaml | kubectl apply -f - >/dev/null 2>&1
+            sleep 20
+            MIG_OUT=$(kubectl -n nvidia-gpu-stack logs mig-check 2>/dev/null | grep "^MIG_STATUS:" | tail -1 || echo "MIG_STATUS:Unknown:0")
+            kubectl -n nvidia-gpu-stack delete pod mig-check --ignore-not-found >/dev/null 2>&1
+            
+            MIG_MODE=$(echo "$MIG_OUT" | cut -d: -f2)
+            MIG_INST=$(echo "$MIG_OUT" | cut -d: -f3 | tr -d '[:space:]')
+            MIG_INST=$${MIG_INST:-0}
+            
+            # Enable MIG if needed
+            if [ "$MIG_MODE" != "Enabled" ]; then
+              log "Enabling MIG on $GPU_NODE..."
+              sed "s/__NODE__/$GPU_NODE/g" /root/templates/mig-enable.yaml | kubectl apply -f - >/dev/null 2>&1
+              sleep 20
+              kubectl -n nvidia-gpu-stack delete pod mig-enable --ignore-not-found >/dev/null 2>&1
+              
+              log "Rebooting $GPU_NODE..."
+              talosctl --talosconfig "$TALOSCONFIG" reboot --nodes "$gpu_ip" >/dev/null 2>&1 &
+              sleep 180
+              
+              for _ in $(seq 1 20); do
+                READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready " || true)
+                READY=$${READY:-0}
+                [ "$READY" -ge "$TOTAL_NODES" ] && break
+                sleep 15
+              done
+              
+              kubectl label node "$GPU_NODE" nvidia.com/gpu.present=true --overwrite >/dev/null 2>&1 || true
+              sleep 30
+              
+              # Wait for MIG mode
+              for _ in $(seq 1 10); do
+                sed "s/__NODE__/$GPU_NODE/g" /root/templates/mig-check.yaml | kubectl apply -f - >/dev/null 2>&1
+                sleep 15
+                MIG_OUT=$(kubectl -n nvidia-gpu-stack logs mig-check 2>/dev/null | grep "^MIG_STATUS:" | tail -1 || echo "MIG_STATUS:Unknown:0")
+                kubectl -n nvidia-gpu-stack delete pod mig-check --ignore-not-found >/dev/null 2>&1
+                MIG_MODE=$(echo "$MIG_OUT" | cut -d: -f2)
+                [ "$MIG_MODE" = "Enabled" ] && break
+                sleep 10
+              done
+              MIG_INST=0
+            fi
+            
+            # Create MIG instances
+            if [ "$MIG_INST" -lt "$MIG_INSTANCE_COUNT" ] 2>/dev/null; then
+              log "Creating MIG instances on $GPU_NODE..."
+              sed -e "s/__NODE__/$GPU_NODE/g" -e "s/__MIG_PROFILE__/$MIG_PROFILE_CONFIG/g" /root/templates/mig-create.yaml | kubectl apply -f - >/dev/null 2>&1
+              sleep 30
+              kubectl -n nvidia-gpu-stack delete pod mig-create --ignore-not-found >/dev/null 2>&1
+            fi
+          done
+        fi
+        
+        log "Deploying device plugin..."
+        kubectl apply -f /root/manifests/device-plugin.yaml >/dev/null 2>&1
+        sleep 30
+      fi
+      
+      GPU_COUNT=$(kubectl get nodes -o json 2>/dev/null | jq '[.items[].status.allocatable["nvidia.com/gpu"] // "0" | tonumber] | add' || echo 0)
+      log "Bootstrap complete - GPU resources: $GPU_COUNT"
+      log "KUBECONFIG: $CONFIG_DIR/kubeconfig"
+
+runcmd:
+  - /root/install.sh
