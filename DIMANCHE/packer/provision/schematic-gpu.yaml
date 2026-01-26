@@ -1,0 +1,28 @@
+# =============================================================================
+# Talos Schematic - GPU (NVIDIA H100 Workers)
+# =============================================================================
+# Using NVIDIA Open GPU Kernel Modules (signed by Siderolabs)
+# 
+# NOTE: nvidia-fabricmanager is NOT included because:
+#   - It's only required for NVLink multi-GPU configurations
+#   - Single H100 doesn't need it
+#   - It can cause startup issues when not needed
+# =============================================================================
+
+customization:
+  extraKernelArgs:
+    - talos.platform=scaleway
+    - ipv6.disable=1
+    - console=ttyS0
+    - earlyprintk=ttyS0
+    - net.core.bpf_jit_harden=1
+    - module_blacklist=nouveau
+  systemExtensions:
+    officialExtensions:
+      - siderolabs/qemu-guest-agent
+      - siderolabs/util-linux-tools
+      - siderolabs/iscsi-tools
+      # NVIDIA Open Source Drivers (signed by Siderolabs - REQUIRED for Talos)
+      - siderolabs/nvidia-open-gpu-kernel-modules-production
+      # NVIDIA Container Toolkit (for container GPU access)
+      - siderolabs/nvidia-container-toolkit-production
