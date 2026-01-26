@@ -1,0 +1,67 @@
+# =============================================================================
+# NVIDIA Device Plugin v0.14.5 - MUST BE DEPLOYED AFTER MIG CONFIGURATION
+# =============================================================================
+# CRITICAL DEPLOYMENT ORDER:
+#   1. Deploy gpu-stack.yaml (namespace, NFD, labeler)
+#   2. Enable MIG mode: nvidia-smi -mig 1
+#   3. Reboot GPU node
+#   4. Create MIG instances: nvidia-smi mig -cgi 19,19,19,19,19,19,19 -C
+#   5. THEN deploy this file
+#
+# DO NOT USE v0.17.0 - has Talos CDI/glibc compatibility issues
+# =============================================================================
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin
+  namespace: nvidia-gpu-stack
+spec:
+  selector:
+    matchLabels:
+      app: nvidia-device-plugin
+  template:
+    metadata:
+      labels:
+        app: nvidia-device-plugin
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - name: nvidia-device-plugin
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.14.5
+          securityContext:
+            privileged: true
+          env:
+            - name: DEVICE_LIST_STRATEGY
+              value: "envvar"
+            - name: PASS_DEVICE_SPECS
+              value: "true"
+            - name: FAIL_ON_INIT_ERROR
+              value: "false"
+            - name: MIG_STRATEGY
+              value: "single"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "all"
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
