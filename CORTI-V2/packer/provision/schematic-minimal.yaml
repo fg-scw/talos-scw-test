@@ -1,0 +1,12 @@
+# Talos Schematic - Minimal (Control Plane & CPU Workers)
+customization:
+  extraKernelArgs:
+    - talos.platform=scaleway
+    - ipv6.disable=1
+    - console=ttyS0
+    - net.core.bpf_jit_harden=1
+  systemExtensions:
+    officialExtensions:
+      - siderolabs/qemu-guest-agent
+      - siderolabs/util-linux-tools
+      - siderolabs/iscsi-tools
